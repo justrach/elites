@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/justrach/elites"
 documentation = "https://docs.rs/elites"
 readme = "README.md"
-keywords = ["map-elites", "evolutionary-algorithm", "optimization", "machine-learning"]
+keywords = ["map-elites", "evolution", "optimization", "ml", "ai"]
 categories = ["algorithms", "science"]
 
 [dependencies]
