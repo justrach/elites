@@ -1,18 +1,12 @@
-[package]
-name = "elites"
+[workspace]
+members = [
+    "elites",      # Core Rust library
+    "elites-py"    # Python bindings
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["Rach Pradhan <rachxpradhan@gmail.com>"]
-description = "A fast and robust implementation of the Map-Elites algorithm in Rust"
+authors = ["Your Name <your.email@example.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/justrach/elites"
-documentation = "https://docs.rs/elites"
-readme = "README.md"
-keywords = ["map-elites", "evolution", "optimization", "ml", "ai"]
-categories = ["algorithms", "science"]
-
-[dependencies]
-rand = "0.8"
-
-[dev-dependencies]
-criterion = "0.4"

@@ -1,0 +1,18 @@
+[package]
+name = "elites-py"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for the Map-Elites algorithm"
+
+[lib]
+name = "elites"
+crate-type = ["cdylib"]
+
+[dependencies]
+elites = { path = "../elites" }
+pyo3 = { version = "0.19", features = ["extension-module"] }
+numpy = "0.19"
+rand = "0.8" 

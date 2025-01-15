@@ -1,0 +1,18 @@
+[package]
+name = "elites"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "A fast and robust implementation of the Map-Elites algorithm in Rust"
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/elites"
+readme = "../README.md"
+keywords = ["map-elites", "evolution", "optimization", "ml", "ai"]
+categories = ["algorithms", "science"]
+
+[dependencies]
+rand = "0.8"
+
+[dev-dependencies]
+criterion = "0.4" 
