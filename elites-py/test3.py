@@ -243,6 +243,13 @@ class SearchOptimizer:
         
         self.best_fitness_seen = -float('inf')
         self.generations_without_improvement = 0
+        
+        # Define behavior characteristics
+        self.behavior_ranges = {
+            'content_type': ['technical', 'overview', 'application', 'news', 'academic'],
+            'specificity': ['broad', 'medium', 'specific'],
+            'temporal': ['recent', 'established', 'historical']
+        }
 
     def _expand_query(self, query: str) -> str:
         expanded_terms = set([query])
@@ -284,41 +291,44 @@ class SearchOptimizer:
         
         return scores / scores.max()  # Normalize
 
+    def get_behavior_characteristics(self, solution: np.ndarray) -> Tuple[float, float]:
+        pages = [self.pages[int(i)] for i in solution]
+        
+        # BC1: Technical Depth (0-1)
+        technical_terms = {
+            'algorithm', 'implementation', 'theory', 'framework', 'architecture',
+            'system', 'method', 'technique', 'analysis', 'research'
+        }
+        technical_scores = []
+        for page in pages:
+            text = f"{page.title} {page.description}".lower()
+            score = sum(term in text for term in technical_terms) / len(technical_terms)
+            technical_scores.append(score)
+        technical_depth = np.mean(technical_scores)
+        
+        # BC2: Topic Diversity (0-1)
+        all_categories = set().union(*[set(p.categories) for p in pages])
+        category_overlap = len(all_categories) / (sum(len(p.categories) for p in pages))
+        
+        return (technical_depth, category_overlap)
+
     def evaluate_solution(self, solution: np.ndarray) -> Tuple[float, Tuple[float, float]]:
         relevance_scores = self.content_similarity[solution]
         title_scores = self.title_similarity[solution]
         
-        weighted_relevance = np.average(relevance_scores, 
-            weights=[1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55])
+        # Basic quality threshold
+        min_relevance = min(relevance_scores[:3])  # First 3 results
+        if min_relevance < 0.2:  # Quality threshold
+            return 0.0, (0.0, 0.0)  # Reject poor solutions
+            
+        # Get behavior characteristics
+        bcs = self.get_behavior_characteristics(solution)
         
-        categories = [set(self.pages[int(i)].categories) for i in solution]
-        unique_categories = set().union(*categories)
-        diversity = np.log1p(len(unique_categories))
+        # Simple fitness - just needs to be "good enough"
+        fitness = float(min_relevance > 0.2)
         
-        authority = np.mean([self.authority_scores[int(i)] for i in solution])
-        title_relevance = np.mean(title_scores) * 2
-        
-        fitness = (
-            weighted_relevance * 0.4 +
-            title_relevance * 0.3 +
-            diversity * 0.2 +
-            authority * 0.1
-        )
-        
-        # Log improvements
-        if fitness > self.best_fitness_seen:
-            self.best_fitness_seen = fitness
-            self.generations_without_improvement = 0
-            self.logger.log(f"\nNew best solution found (fitness: {fitness:.3f}):")
-            for i, idx in enumerate(solution):
-                page = self.pages[int(idx)]
-                self.logger.log(f"  {i+1}. {page.title} (relevance: {relevance_scores[i]:.3f})")
-        else:
-            self.generations_without_improvement += 1
-            if self.generations_without_improvement % 1000 == 0:
-                self.logger.log(f"No improvement for {self.generations_without_improvement} generations")
-        
-        return fitness, (np.mean(relevance_scores), diversity / 10.0)
+        self.logger.log(f"Solution: fitness={fitness:.3f}, bcs={bcs}")
+        return fitness, bcs
 
 def main():
     pages = load_wikipedia_data()
@@ -339,34 +349,51 @@ def main():
         map_elites = MapElites(dimensions=2, bins=20)
         map_elites.solutions = cached_solutions
     else:
-        map_elites = MapElites(dimensions=2, bins=20)
-        print("\nOptimizing search results...")
+        map_elites = MapElites(dimensions=2, bins=30)  # Finer-grained behavior space
+        print("\nExploring search result behaviors...")
         
-        with tqdm(total=20000, desc="Searching") as pbar:
+        with tqdm(total=20000, desc="Exploring") as pbar:
             def progress_wrapper(solution):
                 result = optimizer.evaluate_solution(solution)
                 pbar.update(1)
                 if pbar.n % 1000 == 0:
-                    optimizer.logger.log(f"Processed {pbar.n} solutions")
+                    coverage = len(map_elites.solutions) / (map_elites.bins ** map_elites.dimensions)
+                    optimizer.logger.log(f"Coverage: {coverage:.2%}")
                 return result
             
             map_elites.run(progress_wrapper, len(pages), iterations=20000)
     
-    # Print results
-    print("\nTop Results:")
+    # Print diverse results
+    print("\nDiverse Result Sets:")
     print("=" * 50)
     
-    solutions = sorted(map_elites.solutions.values(), 
-                      key=lambda x: x[0], reverse=True)[:5]
-    best = max(solutions, key=lambda x: x[0])
-    results = [pages[int(i)] for i in best[1]]
+    # Get solutions from different regions of behavior space
+    solutions = []
+    bins = list(map_elites.solutions.keys())
+    if bins:
+        # Get solutions from different corners of behavior space
+        corners = [
+            min(bins, key=lambda x: sum(x)),  # Low-low
+            max(bins, key=lambda x: x[0]),    # High-low
+            max(bins, key=lambda x: x[1]),    # Low-high
+            max(bins, key=lambda x: sum(x))   # High-high
+        ]
+        
+        for bin_key in corners:
+            if map_elites.solutions[bin_key][0] > 0:  # Only show valid solutions
+                solutions.append(map_elites.solutions[bin_key])
     
-    for i, page in enumerate(results, 1):
-        relevance = optimizer.content_similarity[int(best[1][i-1])]
-        print(f"\n{i}. {page.title}")
-        print(f"   Relevance: {relevance:.3f}")
-        print(f"   Categories: {', '.join(page.categories)}")
-        print(f"   Description: {page.description[:100]}...")
+    # Print results with behavior characteristics
+    for i, (fitness, solution, bcs) in enumerate(solutions, 1):
+        print(f"\nResult Set {i}:")
+        print(f"Technical Depth: {bcs[0]:.2f}")
+        print(f"Topic Diversity: {bcs[1]:.2f}")
+        print("-" * 30)
+        
+        results = [pages[int(i)] for i in solution]
+        for j, page in enumerate(results[:5], 1):  # Show top 5 from each set
+            print(f"{j}. {page.title}")
+            print(f"   Categories: {', '.join(page.categories)}")
 
 if __name__ == "__main__":
     main() 
