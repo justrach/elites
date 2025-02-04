@@ -39,6 +39,37 @@
 
 use std::collections::HashMap;
 use rand::Rng;
+use rayon::prelude::*;
+use polars::prelude::*;
+use std::cell::RefCell;
+use std::sync::Arc;
+use parking_lot::RwLock;
+
+// Thread-local workspace to avoid allocations
+thread_local! {
+    static WORKSPACE: RefCell<WorkspaceBuffers> = RefCell::new(WorkspaceBuffers::new());
+}
+
+struct WorkspaceBuffers {
+    genome_matrix: DataFrame,
+    fitness_vec: Series,
+    features_vec: Series,
+}
+
+impl WorkspaceBuffers {
+    fn new() -> Self {
+        // Create empty DataFrame and Series with initial capacity
+        let genome_matrix = DataFrame::new_no_checks(vec![]);
+        let fitness_vec = Series::new_empty("fitness", &DataType::Float64);
+        let features_vec = Series::new_empty("features", &DataType::Float64);
+
+        Self {
+            genome_matrix,
+            fitness_vec,
+            features_vec,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct MapElitesConfig {
@@ -73,8 +104,8 @@ pub struct Individual<T> {
     pub features: Vec<f64>,
 }
 
-pub trait MapElitesProblem {
-    type Genome: Clone;
+pub trait MapElitesProblem: Send + Sync {
+    type Genome: Clone + Send + Sync + std::fmt::Debug;
     fn random_genome(&self) -> Self::Genome;
     fn evaluate(&self, genome: &Self::Genome) -> (f64, Vec<f64>);
     fn mutate(&self, genome: &Self::Genome) -> Self::Genome;
@@ -90,7 +121,7 @@ pub struct MapElites<T: MapElitesProblem> {
     stats: Statistics,
 }
 
-impl<T: MapElitesProblem> MapElites<T> {
+impl<T: MapElitesProblem> MapElites<T> where T::Genome: AsRef<[f64]> {
     /// Create a new Map-Elites instance with default configuration
     pub fn new(problem: T) -> Self {
         Self::with_config(problem, MapElitesConfig::default())
@@ -159,38 +190,137 @@ impl<T: MapElitesProblem> MapElites<T> {
         }
     }
 
+    fn evaluate_batch(&self, genomes: &[T::Genome]) -> Vec<(f64, Vec<f64>)> {
+        WORKSPACE.with(|workspace| {
+            let mut workspace = workspace.borrow_mut();
+            let batch_size = genomes.len();
+            
+            // Create vectors for the genome data
+            let mut genome_data: Vec<Vec<f64>> = Vec::with_capacity(batch_size);
+            for genome in genomes {
+                genome_data.push(genome.as_ref().to_vec());
+            }
+            
+            // Create DataFrame from genome data
+            let mut df = DataFrame::new(vec![
+                Series::new("genome", genome_data.clone())
+            ]).unwrap();
+            
+            // Calculate fitness using polars expressions
+            let fitness = df.clone()
+                .lazy()
+                .select([
+                    col("genome").map(|s| {
+                        Ok(s.iter().map(|x| {
+                            let x = x.unwrap_or(0.0);
+                            -x * x
+                        }).collect::<Float64Chunked>().into_series())
+                    }, GetOutput::from_type(DataType::Float64))
+                ])
+                .collect()
+                .unwrap()
+                .column("genome")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<Option<f64>>>();
+
+            // Create result vector
+            genomes.iter().zip(fitness.iter())
+                .map(|(g, &f)| {
+                    let features = vec![
+                        (g.as_ref()[0] + 1.0) / 2.0,
+                        (g.as_ref()[1] + 1.0) / 2.0
+                    ];
+                    (f.unwrap_or(0.0), features)
+                })
+                .collect()
+        })
+    }
+
     /// Run the Map-Elites algorithm for a specified number of iterations
     pub fn run(&mut self, iterations: usize) {
-        // Initialize with random solutions
-        for _ in 0..self.config.initial_population {
-            let genome = self.problem.random_genome();
-            let (fitness, features) = self.problem.evaluate(&genome);
-            self.add_to_map(Individual { genome, fitness, features });
+        const BATCH_SIZE: usize = 100_000;
+        let num_threads = num_cpus::get() * 2;
+        
+        // Clone methods we'll need in parallel sections
+        let validate = |individual: &Individual<T::Genome>| {
+            if individual.fitness.is_nan() || individual.fitness.is_infinite() {
+                return false;
+            }
+            if self.config.bin_boundaries.is_none() {
+                individual.features.iter().all(|&f| f >= 0.0 && f <= 1.0)
+            } else {
+                true
+            }
+        };
+
+        let features_to_bins = |features: &[f64]| {
+            if let Some(ref boundaries) = self.config.bin_boundaries {
+                features.iter().enumerate()
+                    .map(|(i, &f)| {
+                        boundaries[i].binary_search_by(|probe| probe.partial_cmp(&f).unwrap())
+                            .unwrap_or_else(|x| x)
+                    })
+                    .collect()
+            } else {
+                features.iter()
+                    .map(|&f| ((f * self.bins_per_dimension as f64).floor() as usize)
+                        .min(self.bins_per_dimension - 1))
+                    .collect()
+            }
+        };
+
+        let solutions_lock = Arc::new(RwLock::new(HashMap::new()));
+        
+        // Initialize population
+        let initial_solutions: Vec<_> = (0..self.config.initial_population)
+            .into_par_iter()
+            .map(|_| {
+                let genome = self.problem.random_genome();
+                let (fitness, features) = self.problem.evaluate(&genome);
+                (features_to_bins(&features), Individual { genome, fitness, features })
+            })
+            .filter(|(_, individual)| validate(individual))
+            .collect();
+
+        // Add initial solutions
+        {
+            let mut solutions = solutions_lock.write();
+            for (bins, individual) in initial_solutions {
+                solutions.insert(bins, individual);
+            }
         }
 
-        // Main loop
-        for _ in 0..iterations {
-            if self.solutions.is_empty() {
+        // Process batches
+        for chunk_start in (0..iterations).step_by(BATCH_SIZE) {
+            let chunk_size = (iterations - chunk_start).min(BATCH_SIZE);
+            let current_solutions = solutions_lock.read().values().cloned().collect::<Vec<_>>();
+            
+            if current_solutions.is_empty() {
                 continue;
             }
 
-            // Select random parent
-            let random_solution = self.solutions
-                .values()
-                .nth(rand::thread_rng().gen_range(0..self.solutions.len()))
-                .unwrap()
-                .clone();
+            let offspring: Vec<_> = (0..chunk_size)
+                .into_par_iter()
+                .map(|_| {
+                    let parent = &current_solutions[rand::thread_rng().gen_range(0..current_solutions.len())];
+                    let offspring = self.problem.mutate(&parent.genome);
+                    let (fitness, features) = self.problem.evaluate(&offspring);
+                    (features_to_bins(&features), Individual { genome: offspring, fitness, features })
+                })
+                .filter(|(_, individual)| validate(individual))
+                .collect();
 
-            // Create and evaluate offspring
-            let offspring = self.problem.mutate(&random_solution.genome);
-            let (fitness, features) = self.problem.evaluate(&offspring);
-            
-            self.add_to_map(Individual {
-                genome: offspring,
-                fitness,
-                features,
-            });
+            let mut solutions = solutions_lock.write();
+            for (bins, individual) in offspring {
+                solutions.insert(bins, individual);
+            }
         }
+
+        // Copy back solutions
+        self.solutions = Arc::try_unwrap(solutions_lock).unwrap().into_inner();
 
         if self.config.track_stats {
             self.update_statistics(iterations);

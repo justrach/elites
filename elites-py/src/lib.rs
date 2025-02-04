@@ -3,6 +3,9 @@ use pyo3::types::{PyDict, PyTuple};
 use numpy::PyArray1;
 use rand::Rng;
 use std::collections::HashMap;
+use rayon::ThreadPoolBuilder;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[pyclass]
 struct PyMapElites {
@@ -63,9 +66,12 @@ impl PyMapElites {
     ) -> PyResult<()> {
         // Initialize population
         for _ in 0..self.config.initial_population {
-            let genome: Vec<f64> = random_fn.call0(py)?.extract(py)?;
-            let (fitness, features) = self.evaluate_individual(py, &genome, &evaluate_fn)?;
-            self.add_to_map(Individual { genome, fitness, features });
+            Python::with_gil(|py| {
+                let genome: Vec<f64> = random_fn.call0(py)?.extract(py)?;
+                let (fitness, features) = self.evaluate_individual(py, &genome, &evaluate_fn)?;
+                self.add_to_map(Individual { genome, fitness, features });
+                Ok::<_, PyErr>(())
+            })?;
         }
 
         // Main loop
@@ -74,17 +80,28 @@ impl PyMapElites {
                 continue;
             }
 
-            let random_idx = rand::thread_rng().gen_range(0..self.solutions.len());
-            let parent = self.solutions.values().nth(random_idx).unwrap().clone();
+            let solutions = self.solutions.values().cloned().collect::<Vec<_>>();
+            let parent = &solutions[rand::thread_rng().gen_range(0..solutions.len())];
 
-            let offspring: Vec<f64> = mutate_fn.call1(py, (parent.genome.clone(),))?.extract(py)?;
-            let (fitness, features) = self.evaluate_individual(py, &offspring, &evaluate_fn)?;
-            
-            self.add_to_map(Individual {
-                genome: offspring,
-                fitness,
-                features,
-            });
+            Python::with_gil(|py| {
+                let offspring: Vec<f64> = mutate_fn.call1(py, (parent.genome.clone(),))?.extract(py)?;
+                let (fitness, features) = self.evaluate_individual(py, &offspring, &evaluate_fn)?;
+                self.add_to_map(Individual {
+                    genome: offspring,
+                    fitness,
+                    features,
+                });
+                Ok::<_, PyErr>(())
+            })?;
+
+            // Allow progress bar updates
+            if iterations % 100 == 0 {
+                Python::with_gil(|py| {
+                    py.allow_threads(|| {
+                        std::thread::sleep(std::time::Duration::from_micros(1));
+                    });
+                });
+            }
         }
 
         Ok(())
